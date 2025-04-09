@@ -141,13 +141,25 @@ class OptimizedDivergenceDetector:
                 series = series.to_numpy()
             elif not isinstance(series, np.ndarray):
                 series = np.array(series)
-                
+        
+            # Skip empty series
+            if len(series) == 0:
+                logger.warning(f"Series '{name}' has no data points. Skipping.")
+                continue
+        
             if current_idx is None:
                 current_idx = len(series) - 1
-                
+        
             # Get recent window for analysis
             start_idx = max(0, current_idx - analysis_window + 1)
-            current_windows[name] = series[start_idx:current_idx + 1]
+            window = series[start_idx:current_idx + 1]
+        
+            # Skip if window is empty
+            if len(window) == 0:
+                logger.warning(f"Analysis window for '{name}' is empty. Skipping.")
+                continue
+    
+            current_windows[name] = window
         
         # Detect divergences
         results = {}
@@ -176,12 +188,28 @@ class OptimizedDivergenceDetector:
             mean_change = (current_mean - hist_mean) / hist_mean * 100 if abs(hist_mean) > 1e-10 else 0
             
             # Add a check for window length to avoid division by zero
+            #if len(window) > 0 and hist_std > 1e-10:
+            #    mean_zscore = (current_mean - hist_mean) / (hist_std / np.sqrt(len(window)))
+            #else:
+            #    mean_zscore = 0
+                
+            # Calculate changes
+            if abs(hist_mean) > 1e-10:
+                mean_change = (current_mean - hist_mean) / hist_mean * 100
+            else:
+                mean_change = 0
+    
             if len(window) > 0 and hist_std > 1e-10:
                 mean_zscore = (current_mean - hist_mean) / (hist_std / np.sqrt(len(window)))
             else:
                 mean_zscore = 0
+    
+            if hist_var > 1e-10:
+                variance_ratio = current_var / hist_var
+            else:
+                variance_ratio = 1.0
             
-            variance_ratio = current_var / hist_var if hist_var > 1e-10 else 1.0
+            #variance_ratio = current_var / hist_var if hist_var > 1e-10 else 1.0
             
             # Determine divergence
             mean_diverging = abs(mean_zscore) > (stats.norm.ppf(1 - self.significance_level/2) * self.mean_threshold_modifier)
@@ -332,6 +360,10 @@ def preprocess_time_series(series_dict, options=None):
                     if np.any(outlier_mask):
                         # Remove outliers
                         series = series[~outlier_mask]
+                
+                if len(series) < 2:
+                    logger.warning(f"Series '{name}' has insufficient data points after preprocessing. Skipping.")
+                    continue
                 
                 processed[name] = series
                 
