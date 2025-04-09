@@ -1,0 +1,18 @@
+# Detector Parameters
+# These parameters control the sensitivity of the divergence detector
+
+# Statistical significance level (0.01 = 99% confidence, 0.05 = 95% confidence)
+significance_level = 0.01
+
+# Mean threshold modifier (higher values make mean detection less sensitive)
+mean_threshold_modifier = 1.0
+
+# Variance threshold modifier (higher values make variance detection less sensitive)
+variance_threshold_modifier = 1.0
+
+# IQR factors for outlier detection
+# Higher values include more data points, lower values are more aggressive at removing outliers
+# Used for upper bound: Q3 + factor*IQR
+iqr_factor_plus = 0.5
+# Used for lower bound: Q1 - factor*IQR
+iqr_factor_minus = 0.5

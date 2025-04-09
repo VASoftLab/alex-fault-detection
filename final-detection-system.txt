@@ -1,0 +1,792 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Time Series Divergence Detection System
+
+This module implements a complete system for detecting when one time series
+diverges from others due to either mean changes or variance/standard deviation changes.
+"""
+
+# Import required libraries
+import numpy as np
+import pandas as pd
+from scipy import stats
+import matplotlib.pyplot as plt
+from datetime import datetime, timedelta
+import pickle
+import os
+import logging
+from typing import Dict, List, Tuple, Union, Optional
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('divergence_detector')
+
+class OptimizedDivergenceDetector:
+    """
+    Advanced detector for identifying when one time series diverges from others
+    in terms of either mean or variance/standard deviation.
+    
+    This detector uses multiple statistical methods with weighted consensus and
+    cross-series comparison to robustly identify divergence while minimizing
+    false positives.
+    """
+    
+    def __init__(
+        self, 
+        window_size: int = 30, 
+        min_consecutive_periods: int = 2, 
+        significance_level: float = 0.01,
+        enable_online_learning: bool = False,
+        model_name: str = "default_model"
+    ):
+        """
+        Initialize the divergence detector with configurable parameters.
+        
+        Parameters:
+        -----------
+        window_size : int
+            Size of analysis window (30+ recommended for stable variance estimation)
+        min_consecutive_periods : int
+            Number of consecutive periods required to confirm divergence
+        significance_level : float
+            Statistical significance threshold for tests (0.01 = 99% confidence)
+        enable_online_learning : bool
+            Whether to enable automatic threshold adjustment based on performance
+        model_name : str
+            Name for this model instance (used for saving/loading)
+        """
+        self.window_size = window_size
+        self.min_consecutive_periods = min_consecutive_periods
+        self.significance_level = significance_level
+        self.enable_online_learning = enable_online_learning
+        self.model_name = model_name
+        
+        # State tracking
+        self.consecutive_counters = {}
+        self.historical_stats = {}
+        self.series_names = []
+        self.historical_divergences = []
+        
+        # Performance metrics for online learning
+        self.false_positives = 0
+        self.false_negatives = 0
+        self.true_positives = 0
+        
+        # Learning parameters
+        self.mean_threshold_modifier = 1.0
+        self.variance_threshold_modifier = 1.0
+        self.learning_rate = 0.05
+        
+        logger.info(f"Initialized {self.__class__.__name__} with window_size={window_size}, "
+                   f"min_consecutive_periods={min_consecutive_periods}, "
+                   f"significance_level={significance_level}")
+    
+    def fit(self, time_series_dict: Dict[str, Union[List, np.ndarray, pd.Series]], 
+            training_period: Optional[Tuple[int, int]] = None) -> 'OptimizedDivergenceDetector':
+        """
+        Establish baseline statistics for each time series.
+        
+        Parameters:
+        -----------
+        time_series_dict : dict
+            Dictionary mapping series names to time series data
+        training_period : tuple or None
+            Optional (start_idx, end_idx) to specify training data range
+            
+        Returns:
+        --------
+        self : OptimizedDivergenceDetector
+            The fitted detector
+        """
+        self.series_names = list(time_series_dict.keys())
+        
+        for name, series in time_series_dict.items():
+            # Initialize counter for consecutive divergence periods
+            self.consecutive_counters[name] = {
+                'mean': 0,
+                'variance': 0
+            }
+            
+            # Convert to numpy array if it's not already
+            if isinstance(series, pd.Series):
+                series = series.to_numpy()
+            elif not isinstance(series, np.ndarray):
+                series = np.array(series)
+            
+            # Use specified training period or full series
+            if training_period:
+                start_idx, end_idx = training_period
+                training_data = series[start_idx:end_idx]
+            else:
+                training_data = series
+                
+            # Calculate and store historical statistics
+            self.historical_stats[name] = {}
+            
+            # Basic statistics
+            self.historical_stats[name]['mean'] = np.mean(training_data)
+            self.historical_stats[name]['std'] = np.std(training_data)
+            self.historical_stats[name]['var'] = np.var(training_data)
+            self.historical_stats[name]['median'] = np.median(training_data)
+            
+            # Store quartiles for robust variance estimation
+            self.historical_stats[name]['q1'] = np.percentile(training_data, 25)
+            self.historical_stats[name]['q3'] = np.percentile(training_data, 75)
+            self.historical_stats[name]['iqr'] = self.historical_stats[name]['q3'] - self.historical_stats[name]['q1']
+            
+            # Store time pattern information for 24-hour seasonality (if enough data)
+            if len(training_data) >= 96:  # At least one day of data (assuming 15-min intervals)
+                hourly_patterns = {}
+                for hour in range(24):
+                    # Extract data points for this hour (assuming 4 points per hour for 15-min data)
+                    hour_idxs = [i for i in range(len(training_data)) if (i // 4) % 24 == hour]
+                    if hour_idxs:
+                        hour_data = training_data[hour_idxs]
+                        hourly_patterns[hour] = {
+                            'mean': np.mean(hour_data),
+                            'std': np.std(hour_data)
+                        }
+                self.historical_stats[name]['hourly_patterns'] = hourly_patterns
+            
+            # Calculate cross-correlations with other series
+            self.historical_stats[name]['correlations'] = {}
+            for other_name, other_series in time_series_dict.items():
+                if other_name != name:
+                    if isinstance(other_series, pd.Series):
+                        other_data = other_series.to_numpy()
+                    elif not isinstance(other_series, np.ndarray):
+                        other_data = np.array(other_series)
+                    else:
+                        other_data = other_series
+                    
+                    if training_period:
+                        other_data = other_data[start_idx:end_idx]
+                    
+                    # Ensure same length for correlation
+                    min_len = min(len(training_data), len(other_data))
+                    corr = np.corrcoef(training_data[:min_len], other_data[:min_len])[0, 1]
+                    self.historical_stats[name]['correlations'][other_name] = corr
+        
+        logger.info(f"Fit completed on {len(self.series_names)} series with {len(training_data)} points")
+        return self
+    
+    def detect(self, time_series_dict: Dict[str, Union[List, np.ndarray, pd.Series]], 
+               analysis_window: Optional[int] = None, 
+               current_idx: Optional[int] = None) -> Dict[str, Dict]:
+        """
+        Detect if any series is diverging due to mean or variance changes.
+        
+        Parameters:
+        -----------
+        time_series_dict : dict
+            Dictionary mapping series names to data
+        analysis_window : int or None
+            Number of recent points to analyze for divergence (uses default if None)
+        current_idx : int or None
+            Optional index to specify current time (end of analysis window)
+            
+        Returns:
+        --------
+        dict
+            Results of divergence detection for each series
+        """
+        # Use default window if not specified
+        if analysis_window is None:
+            analysis_window = self.window_size
+        
+        # Extract windows for analysis
+        current_windows = {}
+        for name, series in time_series_dict.items():
+            if isinstance(series, pd.Series):
+                series = series.to_numpy()
+            elif not isinstance(series, np.ndarray):
+                series = np.array(series)
+                
+            if current_idx is None:
+                current_idx = len(series) - 1
+                
+            # Get recent window for analysis
+            start_idx = max(0, current_idx - analysis_window + 1)
+            current_windows[name] = series[start_idx:current_idx + 1]
+        
+        # Get detection results for both types of divergence
+        mean_results = self._detect_mean_changes(current_windows)
+        variance_results = self._detect_variance_changes(current_windows)
+        
+        # Combine and process results
+        results = self._process_results(mean_results, variance_results)
+        
+        # Store divergences for learning and analysis
+        timestamp = datetime.now()
+        for name, result in results.items():
+            if result['any_divergence']:
+                self.historical_divergences.append({
+                    'timestamp': timestamp,
+                    'series_name': name,
+                    'mean_diverging': result['mean_diverging'],
+                    'variance_diverging': result['variance_diverging'],
+                    'mean_change': result['mean_change'],
+                    'variance_ratio': result['variance_ratio'],
+                    'mean_zscore': result['mean_zscore'],
+                    'variance_zscore': result['f_zscore']
+                })
+        
+        logger.info(f"Detection completed: {sum(1 for r in results.values() if r['any_divergence'])} "
+                   f"series flagged out of {len(results)}")
+        return results
+    
+    def _detect_mean_changes(self, current_windows: Dict[str, np.ndarray]) -> Dict[str, Dict]:
+        """
+        Detect mean changes using multiple methods with weighted scoring.
+        
+        Parameters:
+        -----------
+        current_windows : dict
+            Dictionary of current analysis windows
+            
+        Returns:
+        --------
+        dict
+            Detection results for mean changes
+        """
+        results = {}
+        
+        # METHOD 1: Statistical significance test (25% weight)
+        statistical_results = self._statistical_mean_test(current_windows)
+        
+        # METHOD 2: Cross-series relative change analysis (50% weight)
+        relative_change_results = self._relative_mean_change(current_windows)
+        
+        # METHOD 3: Pattern consistency analysis (25% weight)
+        pattern_results = self._pattern_consistency(current_windows)
+        
+        # Combine results with weighted scoring
+        for name in self.series_names:
+            # Calculate weighted score (max 4.5)
+            methods_score = 0
+            
+            # Statistical significance (25% weight + bonus)
+            stat_threshold = stats.norm.ppf(1 - self.significance_level/2) * self.mean_threshold_modifier
+            stat_significant = abs(statistical_results[name]['zscore']) > stat_threshold
+            
+            if stat_significant:
+                methods_score += 1.0
+                # Bonus for very strong signal
+                if abs(statistical_results[name]['zscore']) > 2 * stat_threshold:
+                    methods_score += 0.5
+            
+            # Relative change significance (50% weight)
+            rel_threshold = 2.0 * self.mean_threshold_modifier
+            rel_significant = abs(relative_change_results[name]['zscore']) > rel_threshold
+            
+            if rel_significant:
+                methods_score += 2.0
+            
+            # Pattern consistency (25% weight)
+            if pattern_results[name]['significant']:
+                methods_score += 1.0
+            
+            # Determine divergence (threshold at >50% of max score)
+            is_diverging = methods_score >= 2.5
+            
+            # Update consecutive counter
+            if is_diverging:
+                self.consecutive_counters[name]['mean'] += 1
+            else:
+                self.consecutive_counters[name]['mean'] = 0
+            
+            # Determine if persistent divergence
+            persistent_divergence = self.consecutive_counters[name]['mean'] >= self.min_consecutive_periods
+            
+            # Store results
+            results[name] = {
+                'percent_change': relative_change_results[name]['percent_change'],
+                'statistical_zscore': statistical_results[name]['zscore'],
+                'relative_zscore': relative_change_results[name]['zscore'],
+                'pattern_consistency': pattern_results[name]['consistency'],
+                'methods_score': methods_score,
+                'consecutive_periods': self.consecutive_counters[name]['mean'],
+                'diverging': persistent_divergence
+            }
+        
+        return results
+    
+    def _detect_variance_changes(self, current_windows: Dict[str, np.ndarray]) -> Dict[str, Dict]:
+        """
+        Detect variance changes using multiple methods with weighted scoring.
+        
+        Parameters:
+        -----------
+        current_windows : dict
+            Dictionary of current analysis windows
+            
+        Returns:
+        --------
+        dict
+            Detection results for variance changes
+        """
+        results = {}
+        
+        # METHOD 1: F-test for variance comparison (50% weight)
+        f_test_results = self._f_test(current_windows)
+        
+        # METHOD 2: Variance ratio analysis (25% weight)
+        variance_ratio_results = self._variance_ratio(current_windows)
+        
+        # METHOD 3: Robust IQR analysis (25% weight)
+        iqr_results = self._iqr_analysis(current_windows)
+        
+        # Combine results with weighted scoring
+        for name in self.series_names:
+            # Calculate weighted score (max 4.0)
+            methods_score = 0
+            
+            # F-test (50% weight + bonus)
+            f_threshold = 2.5 * self.variance_threshold_modifier
+            rel_f_threshold = 1.5 * self.variance_threshold_modifier
+            
+            f_significant = (f_test_results[name]['f_stat'] > f_threshold and 
+                            abs(f_test_results[name]['zscore']) > rel_f_threshold)
+            
+            if f_significant:
+                methods_score += 2.0
+                # Bonus for very strong signal
+                if f_test_results[name]['f_stat'] > 2 * f_threshold:
+                    methods_score += 0.5
+            
+            # Variance ratio (25% weight)
+            if variance_ratio_results[name]['significant']:
+                methods_score += 1.0
+            
+            # IQR analysis (25% weight)
+            if iqr_results[name]['significant']:
+                methods_score += 1.0
+            
+            # Determine divergence (threshold at >60% of max score)
+            is_diverging = methods_score >= 2.5
+            
+            # Update consecutive counter
+            if is_diverging:
+                self.consecutive_counters[name]['variance'] += 1
+            else:
+                self.consecutive_counters[name]['variance'] = 0
+            
+            # Determine if persistent divergence
+            persistent_divergence = self.consecutive_counters[name]['variance'] >= self.min_consecutive_periods
+            
+            # Store results
+            results[name] = {
+                'variance_ratio': variance_ratio_results[name]['ratio'],
+                'f_stat': f_test_results[name]['f_stat'],
+                'f_zscore': f_test_results[name]['zscore'],
+                'iqr_change': iqr_results[name]['change'],
+                'variance_decreased': f_test_results[name]['variance_decreased'],
+                'methods_score': methods_score,
+                'consecutive_periods': self.consecutive_counters[name]['variance'],
+                'diverging': persistent_divergence
+            }
+        
+        return results
+    
+    def _statistical_mean_test(self, current_windows: Dict[str, np.ndarray]) -> Dict[str, Dict]:
+        """
+        Perform statistical test for mean changes.
+        """
+        results = {}
+        
+        for name, window in current_windows.items():
+            # Calculate current mean
+            current_mean = np.mean(window)
+            
+            # Get historical statistics
+            hist_mean = self.historical_stats[name]['mean']
+            hist_std = self.historical_stats[name]['std']
+            
+            # Calculate z-score (t-statistic)
+            zscore = (current_mean - hist_mean) / (hist_std / np.sqrt(len(window)))
+            
+            # Determine significance with appropriate threshold
+            critical_value = stats.norm.ppf(1 - self.significance_level/2)
+            is_significant = abs(zscore) > critical_value
+            
+            results[name] = {
+                'zscore': zscore,
+                'significant': is_significant
+            }
+        
+        return results
+    
+    def _relative_mean_change(self, current_windows: Dict[str, np.ndarray]) -> Dict[str, Dict]:
+        """
+        Compare relative mean changes across series.
+        """
+        results = {}
+        
+        # Calculate percent changes for all series
+        percent_changes = {}
+        for name, window in current_windows.items():
+            current_mean = np.mean(window)
+            hist_mean = self.historical_stats[name]['mean']
+            
+            if hist_mean != 0:
+                change = (current_mean - hist_mean) / hist_mean * 100
+            else:
+                change = 0  # Avoid division by zero
+                
+            percent_changes[name] = change
+        
+        # Calculate z-scores of percent changes
+        change_values = np.array(list(percent_changes.values()))
+        mean_change = np.mean(change_values)
+        std_change = np.std(change_values)
+        
+        for name in self.series_names:
+            if std_change > 0:
+                zscore = (percent_changes[name] - mean_change) / std_change
+            else:
+                zscore = 0
+            
+            # Determine significance - threshold adjusted by modifier
+            threshold = 2.0 * self.mean_threshold_modifier
+            is_significant = abs(zscore) > threshold
+            
+            results[name] = {
+                'percent_change': percent_changes[name],
+                'zscore': zscore,
+                'significant': is_significant
+            }
+        
+        return results
+    
+    def _pattern_consistency(self, current_windows: Dict[str, np.ndarray]) -> Dict[str, Dict]:
+        """
+        Analyze pattern consistency to validate mean changes.
+        """
+        results = {}
+        
+        for name, window in current_windows.items():
+            hist_mean = self.historical_stats[name]['mean']
+            current_mean = np.mean(window)
+            
+            # Direction of change
+            direction = 1 if current_mean > hist_mean else -1
+            
+            # Count points consistent with direction
+            consistent_points = sum(1 for point in window if (point - hist_mean) * direction > 0)
+            consistency = consistent_points / len(window)
+            
+            # Significant if highly consistent pattern (threshold 70%)
+            is_significant = consistency > 0.7
+            
+            results[name] = {
+                'consistency': consistency,
+                'significant': is_significant
+            }
+        
+        return results
+    
+    def _f_test(self, current_windows: Dict[str, np.ndarray]) -> Dict[str, Dict]:
+        """
+        Perform F-test to detect variance changes.
+        """
+        results = {}
+        
+        # Calculate F-statistics for all series
+        f_stats = {}
+        variance_decreased = {}
+        
+        for name, window in current_windows.items():
+            # Calculate current variance
+            current_var = np.var(window)
+            
+            # Get historical variance
+            hist_var = self.historical_stats[name]['var']
+            
+            # F-statistic (ratio of variances)
+            # Ensure larger variance is in numerator for consistent interpretation
+            if hist_var >= current_var:
+                f_stat = hist_var / current_var
+                variance_decreased[name] = True
+            else:
+                f_stat = current_var / hist_var
+                variance_decreased[name] = False
+            
+            f_stats[name] = f_stat
+        
+        # Calculate z-scores of F-statistics
+        f_values = np.array(list(f_stats.values()))
+        mean_f = np.mean(f_values)
+        std_f = np.std(f_values)
+        
+        for name in self.series_names:
+            if std_f > 0:
+                zscore = (f_stats[name] - mean_f) / std_f
+            else:
+                zscore = 0
+            
+            # Two-part significance test with adjusted thresholds:
+            # 1. F-statistic exceeds critical value (absolute significance)
+            # 2. F-statistic is an outlier compared to other series (relative significance)
+            critical_f = 2.5 * self.variance_threshold_modifier
+            rel_threshold = 1.5 * self.variance_threshold_modifier
+            
+            is_significant = (f_stats[name] > critical_f and abs(zscore) > rel_threshold)
+            
+            results[name] = {
+                'f_stat': f_stats[name],
+                'zscore': zscore,
+                'variance_decreased': variance_decreased[name],
+                'significant': is_significant
+            }
+        
+        return results
+    
+    def _variance_ratio(self, current_windows: Dict[str, np.ndarray]) -> Dict[str, Dict]:
+        """
+        Analyze variance ratios across series.
+        """
+        results = {}
+        
+        # Calculate variance ratios
+        ratios = {}
+        for name, window in current_windows.items():
+            current_var = np.var(window)
+            hist_var = self.historical_stats[name]['var']
+            
+            if hist_var > 0:
+                ratio = current_var / hist_var
+            else:
+                ratio = 1.0  # Default if historical variance is zero
+                
+            ratios[name] = ratio
+        
+        # Calculate z-scores of ratios
+        ratio_values = np.array(list(ratios.values()))
+        mean_ratio = np.mean(ratio_values)
+        std_ratio = np.std(ratio_values)
+        
+        for name in self.series_names:
+            if std_ratio > 0:
+                zscore = (ratios[name] - mean_ratio) / std_ratio
+            else:
+                zscore = 0
+            
+            # Significant if z-score exceeds threshold (adjusted by modifier)
+            threshold = 2.0 * self.variance_threshold_modifier
+            is_significant = abs(zscore) > threshold
+            
+            results[name] = {
+                'ratio': ratios[name],
+                'zscore': zscore,
+                'significant': is_significant
+            }
+        
+        return results
+    
+    def _iqr_analysis(self, current_windows: Dict[str, np.ndarray]) -> Dict[str, Dict]:
+        """
+        Use IQR for robust variance change detection.
+        """
+        results = {}
+        
+        # Calculate IQR changes
+        iqr_changes = {}
+        for name, window in current_windows.items():
+            # Calculate current IQR
+            q1 = np.percentile(window, 25)
+            q3 = np.percentile(window, 75)
+            iqr = q3 - q1
+            
+            # Historical IQR
+            hist_iqr = self.historical_stats[name]['iqr']
+            
+            # Calculate relative change
+            if hist_iqr > 0:
+                change = (iqr - hist_iqr) / hist_iqr
+            else:
+                change = 0
+                
+            iqr_changes[name] = change
+        
+        # Calculate z-scores of IQR changes
+        change_values = np.array(list(iqr_changes.values()))
+        mean_change = np.mean(change_values)
+        std_change = np.std(change_values)
+        
+        for name in self.series_names:
+            if std_change > 0:
+                zscore = (iqr_changes[name] - mean_change) / std_change
+            else:
+                zscore = 0
+            
+            # Significant if z-score exceeds threshold (adjusted by modifier)
+            threshold = 2.0 * self.variance_threshold_modifier
+            is_significant = abs(zscore) > threshold
+            
+            results[name] = {
+                'change': iqr_changes[name],
+                'zscore': zscore,
+                'significant': is_significant
+            }
+        
+        return results
+    
+    def _process_results(self, mean_results: Dict[str, Dict], 
+                         variance_results: Dict[str, Dict]) -> Dict[str, Dict]:
+        """
+        Process and combine results from mean and variance detection.
+        
+        This function:
+        1. Combines mean and variance detection results
+        2. Applies system-wide change filtering
+        3. Handles interactions between mean and variance detection
+        """
+        combined_results = {}
+        
+        # First, combine results
+        for name in self.series_names:
+            combined_results[name] = {
+                # Mean change metrics
+                'mean_change': mean_results[name]['percent_change'],
+                'mean_zscore': mean_results[name]['statistical_zscore'],
+                'mean_relative_zscore': mean_results[name]['relative_zscore'],
+                'mean_pattern_consistency': mean_results[name]['pattern_consistency'],
+                'mean_methods_score': mean_results[name]['methods_score'],
+                'mean_consecutive_periods': mean_results[name]['consecutive_periods'],
+                'mean_diverging': mean_results[name]['diverging'],
+                
+                # Variance change metrics
+                'variance_ratio': variance_results[name]['variance_ratio'],
+                'f_stat': variance_results[name]['f_stat'],
+                'f_zscore': variance_results[name]['f_zscore'],
+                'iqr_change': variance_results[name]['iqr_change'],
+                'variance_decreased': variance_results[name]['variance_decreased'],
+                'variance_methods_score': variance_results[name]['methods_score'],
+                'variance_consecutive_periods': variance_results[name]['consecutive_periods'],
+                'variance_diverging': variance_results[name]['diverging'],
+                
+                # Combined status
+                'any_divergence': mean_results[name]['diverging'] or variance_results[name]['diverging']
+            }
+        
+        # Filter system-wide mean changes
+        self._filter_system_wide_changes(combined_results, 'mean')
+        
+        # Filter system-wide variance changes
+        self._filter_system_wide_changes(combined_results, 'variance')
+        
+        # Update 'any_divergence' flag
+        for name in self.series_names:
+            combined_results[name]['any_divergence'] = (
+                combined_results[name]['mean_diverging'] or 
+                combined_results[name]['variance_diverging']
+            )
+        
+        return combined_results
+    
+    def _filter_system_wide_changes(self, results: Dict[str, Dict], change_type: str):
+        """
+        Filter out system-wide changes to reduce false positives.
+        
+        Parameters:
+        -----------
+        results : dict
+            Detection results to filter
+        change_type : str
+            Type of change to filter ('mean' or 'variance')
+        """
+        # Get series flagged as diverging
+        flagged_series = [
+            name for name in self.series_names 
+            if results[name][f'{change_type}_diverging']
+        ]
+        
+        if len(flagged_series) <= 1:
+            # Zero or one series flagged - no filtering needed
+            return
+            
+        # Multiple series flagged - potential system-wide change
+        if change_type == 'mean':
+            # Get relative z-scores and method scores
+            zscores = {name: abs(results[name]['mean_relative_zscore']) for name in flagged_series}
+            scores = {name: results[name]['mean_methods_score'] for name in flagged_series}
+        else:  # variance
+            # Get F-statistics and method scores
+            zscores = {name: abs(results[name]['f_zscore']) for name in flagged_series}
+            scores = {name: results[name]['variance_methods_score'] for name in flagged_series}
+        
+        # Find the strongest signal
+        strongest_series = max(scores.items(), key=lambda x: x[1])[0]
+        max_score = scores[strongest_series]
+        
+        # Find second strongest
+        other_scores = {k: v for k, v in scores.items() if k != strongest_series}
+        second_strongest = max(other_scores.values()) if other_scores else 0
+        
+        # Only keep the strongest if it's significantly stronger
+        if max_score > second_strongest * 1.3:
+            # Reset flags for all except the strongest
+            for name in flagged_series:
+                if name != strongest_series:
+                    results[name][f'{change_type}_diverging'] = False
+        else:
+            # System-wide change - reset all flags
+            for name in flagged_series:
+                results[name][f'{change_type}_diverging'] = False
+                results[name]['system_wide_change'] = True
+    
+    def provide_feedback(self, feedback: Dict[str, List[str]]):
+        """
+        Provide feedback to the detector for online learning.
+        
+        Parameters:
+        -----------
+        feedback : dict
+            Dictionary with 'true_positives', 'false_positives', and 'false_negatives' lists
+            containing series names
+        """
+        if not self.enable_online_learning:
+            logger.info("Online learning disabled - feedback ignored")
+            return
+        
+        # Update counters
+        self.true_positives += len(feedback.get('true_positives', []))
+        self.false_positives += len(feedback.get('false_positives', []))
+        self.false_negatives += len(feedback.get('false_negatives', []))
+        
+        # Calculate precision and recall
+        if self.true_positives + self.false_positives > 0:
+            precision = self.true_positives / (self.true_positives + self.false_positives)
+        else:
+            precision = 1.0
+            
+        if self.true_positives + self.false_negatives > 0:
+            recall = self.true_positives / (self.true_positives + self.false_negatives)
+        else:
+            recall = 1.0
+        
+        # Adjust thresholds based on feedback
+        if self.false_positives > self.false_negatives:
+            # Too many false positives - make thresholds more conservative
+            self.mean_threshold_modifier *= (1 + self.learning_rate)
+            self.variance_threshold_modifier *= (1 + self.learning_rate)
+            
+            logger.info(f"Adjusted thresholds to reduce false positives: "
+                       f"mean_modifier={self.mean_threshold_modifier:.3f}, "
+                       f"variance_modifier={self.variance_threshold_modifier:.3f}")
+        
+        elif self.false_negatives > self.false_positives:
+            # Too many false negatives - make thresholds more sensitive
+            self.mean_threshold_modifier *= (1 - self.learning_rate)
+            self.variance_threshold_modifier *= (1 - self.learning_rate)
+            
+            # Ensure we don't go below reasonable values
+            self.mean_threshold_modifier = max(0.5, self.mean_threshold_modifier)
+            self.variance_threshold_modifier = max(0.5, self.variance_threshold_modifier)
+            
+            logger.info(f"Adjusted thresholds to reduce false negatives: "
+                      f"mean_modifier={self.mean_threshold_modifier:.3f

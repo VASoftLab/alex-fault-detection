@@ -1,0 +1,5 @@
+*.docx
+*.xlsx
+*.bat
+sensor-fault-detection/data/output/
+*.pdf
